@@ -6,6 +6,7 @@ from collections import deque
 import numpy as np
 import mediapipe as mp
 import pupil_apriltags
+from utils import SerialCommand
 
 # 初始化MediaPipe手部解决方案
 mp_hands = mp.solutions.hands
@@ -33,60 +34,102 @@ real_coords = np.array([
 CAMERA1_ID = 0          # 摄像头1的ID (1080p)
 CAMERA2_ID = 1          # 摄像头2的ID (4K)
 SERIAL_PORT = '/dev/tty.usbmodem113201'  # 串口设备名称，根据实际情况修改
-BAUD_RATE = 9600      # 波特率，根据实际情况修改
-DELAY_MS = 40           # 摄像头2延迟采集的毫秒数
+BAUD_RATE = 115200     # 波特率，根据实际情况修改
+DELAY_MS = 30           # 摄像头2延迟采集的毫秒数
 
 # 用于存储数据的deque
 imu_data_deque = deque(maxlen=100)
 camera2_frame_deque = deque(maxlen=15)
 stop_thread = False
+i2cAddress = 0x04
+cmdItr_ = 0  # 从0开始，每次调用后递增
+location = 128
+nBytes = 6
 
-# IMU数据读取线程
-def read_imu_data(serial_port):
+def read_force_data(serial_port):
     try:
         ser = serial.Serial(port=serial_port, baudrate=BAUD_RATE, timeout=1)
+        ser = serial.Serial(
+            port=serial_port,
+            baudrate=BAUD_RATE,
+            timeout=1,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE
+        )
+
         print(f"串口 {serial_port} 打开成功")
-        current_line = ""
         
         while not stop_thread:
-            if ser.in_waiting > 0:
-                # Read all available data
-                data = ser.read(ser.in_waiting)
-                # Attempt to decode the data as a string
-                text = data.decode('utf-8', errors='replace')
-                
-                # Process the received data
-                for char in text:
-                    if char == '\n' or char == '\r':  # If it's a newline character
-                        if current_line:  # If there's data in the current line
-                            # Here you can process the complete line of data
-                            try:
-                                value = [float(e) for e in current_line.rstrip(';').split(',')]
-                                # Emit the signal with the parsed values
-                                timestamp = time.time()
-                                imu_data_deque.append((timestamp, value))
-                            except ValueError:
-                                print(f"Error in line: {current_line}")
-                            
-                            # Clear the current line for the next data
-                            current_line = ""
-                    else:
-                        # If not a newline, add the character to the current line
-                        current_line += char
+            cmdToArduino = SerialCommand.GenerateReadCommand(i2cAddress, cmdItr_, location, nBytes)
+            ser.write(cmdToArduino)
+            time.sleep(0.01)
 
-                # line = ser.readline().decode('utf-8').strip()
-            # if ser.in_waiting:
-            #     line = ser.readline().decode('utf-8').strip()
-            #     timestamp = time.time()
-            #     imu_data_deque.append((timestamp, line))
-            # time.sleep(0.001)  # 小延迟避免CPU占用过高
+            response = ser.read(22)
+            timestamp = time.time()
+            # print("response",response)
+            byte_data = response
+            sensor_data_length = (len(byte_data) - SerialCommand.TIMESTAMP_SIZE - 4) // 2
+            sensor_data = [0] * sensor_data_length
+    
+            for i in range(sensor_data_length):
+                sensor_data[i] = (byte_data[2 * i + 4 + SerialCommand.TIMESTAMP_SIZE] << 8) + byte_data[2 * i + 5 + SerialCommand.TIMESTAMP_SIZE]
+            # print(sensor_data[4])
+            imu_data_deque.append((timestamp, sensor_data[4]))
+
     except Exception as e:
         print(f"串口读取错误: {e}")
     finally:
         ser.close()
         print("串口已关闭")
 
-# 获取最接近指定时间戳的IMU数据
+
+# IMU数据读取线程
+# def read_imu_data(serial_port):
+#     try:
+#         ser = serial.Serial(port=serial_port, baudrate=BAUD_RATE, timeout=1)
+#         print(f"串口 {serial_port} 打开成功")
+#         current_line = ""
+#
+#         while not stop_thread:
+#             if ser.in_waiting > 0:
+#                 # Read all available data
+#                 data = ser.read(ser.in_waiting)
+#                 # Attempt to decode the data as a string
+#                 text = data.decode('utf-8', errors='replace')
+#
+#                 # Process the received data
+#                 for char in text:
+#                     if char == '\n' or char == '\r':  # If it's a newline character
+#                         if current_line:  # If there's data in the current line
+#                             # Here you can process the complete line of data
+#                             try:
+#                                 value = [float(e) for e in current_line.rstrip(';').split(',')]
+#                                 # Emit the signal with the parsed values
+#                                 timestamp = time.time()
+#                                 imu_data_deque.append((timestamp, value))
+#                             except ValueError:
+#                                 print(f"Error in line: {current_line}")
+#
+#                             # Clear the current line for the next data
+#                             current_line = ""
+#                     else:
+#                         # If not a newline, add the character to the current line
+#                         current_line += char
+#
+#                 # line = ser.readline().decode('utf-8').strip()
+#             # if ser.in_waiting:
+#             #     line = ser.readline().decode('utf-8').strip()
+#             #     timestamp = time.time()
+#             #     imu_data_deque.append((timestamp, line))
+#             # time.sleep(0.001)  # 小延迟避免CPU占用过高
+#     except Exception as e:
+#         print(f"串口读取错误: {e}")
+#     finally:
+#         ser.close()
+#         print("串口已关闭")
+
+# get the closet force data
 def get_closest_imu_data(target_timestamp):
     if not imu_data_deque:
         return None
@@ -105,7 +148,7 @@ def get_closest_imu_data(target_timestamp):
 
 
 def process_hand(frame):
-    # 转换为RGB（MediaPipe需要RGB格式）
+    # convert from opencv brg to rgb format
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
     # 处理帧并检测手部
@@ -115,10 +158,8 @@ def process_hand(frame):
     # 如果检测到手部
     if results.multi_hand_landmarks:
         for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-            # 检查是否为右手
             is_right = handedness.classification[0].label == "Left"
             
-            # 绘制所有手部关键点和连接
             mp_drawing.draw_landmarks(
                 frame,
                 hand_landmarks,
@@ -127,20 +168,17 @@ def process_hand(frame):
                 mp_drawing_styles.get_default_hand_connections_style()
             )
             
-            # 获取右手食指指尖关键点 (索引8)
             if is_right:
-                # 获取食指指尖坐标
+                # get index fingertip
                 index_finger_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
                 
-                # 转换为像素坐标
                 h, w, c = frame.shape
                 x, y = int(index_finger_tip.x * w), int(index_finger_tip.y * h)
                 pts = (index_finger_tip.x * w, index_finger_tip.y * h)
                 
-                # 在食指指尖位置绘制明显的圆圈
+                # circle the index fingertip
                 cv2.circle(frame, (x, y), 15, (0, 0, 255), -1)  # 红色圆圈
                 
-                # 显示坐标
                 cv2.putText(frame, f"Left Hand Index: ({x}, {y})", (x-10, y-10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     
@@ -183,7 +221,7 @@ def detect_apriltags(frame):
             # Draw detected tags
             for tag in tags:
                 corners = tag.corners
-                # corners 可能是浮点数，需要转成 int
+                # corners float to int
                 corners = [(int(pt[0]), int(pt[1])) for pt in corners]
 
                 corners_arr = np.array(corners, dtype=np.int32)
@@ -220,30 +258,27 @@ def map_to_real_coords(point, homography):
 
 
 def main():
-    # 打开摄像头
     cap1 = cv2.VideoCapture(CAMERA1_ID)
     cap2 = cv2.VideoCapture(CAMERA2_ID)
     
-    # 设置摄像头分辨率
     cap1.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
     cap1.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     
     cap2.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
     cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
     
-    # 检查摄像头是否成功打开
     if not cap1.isOpened():
-        print("无法打开摄像头1")
+        print("cannot open cam 1")
         return
     
     if not cap2.isOpened():
-        print("无法打开摄像头2")
+        print("cannot open cam 2")
         cap1.release()
         return
     
-    # 启动IMU数据读取线程
-    imu_thread = threading.Thread(target=read_imu_data, args=(SERIAL_PORT,), daemon=True)
-    imu_thread.start()
+    # start force data thread
+    force_thread = threading.Thread(target=read_force_data, args=(SERIAL_PORT,), daemon=True)
+    force_thread.start()
     
     print("程序已启动。按 'q' 退出。")
     sync_times = 0
@@ -298,17 +333,14 @@ def main():
                                 real_touch_pts = map_to_real_coords(pts, homography)
                                 print(real_touch_pts)
                             
-                            # 显示摄像头1的画面
-                            # cv2.imshow('Camera 1 (1080p)', frame1)
+                            cv2.imshow('Camera 1 (1080p)', frame1)
                             
                             # 调整摄像头2的图像大小以便于显示（4K图像太大）
                             # 将图像缩小到原来的1/2大小
                             frame2_resized = cv2.resize(frame2, (frame2.shape[1]//2, frame2.shape[0]//2))
                             
-                            # 显示摄像头2的画面
                             cv2.imshow('Camera 2 (4K)', frame2_resized)
                             
-                            # 存储摄像头2的图像
                             camera2_frame_deque.append((cam2_timestamp, frame2))
                 
                 # 检查键盘输入，按q退出
